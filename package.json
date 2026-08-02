@@ -1,0 +1,17 @@
+{
+  "name": "bookora-openai-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent relay to the OpenAI API for servers behind censorship (Iran VPS). Deploy on Deno Deploy, Cloudflare Workers, or Netlify.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:deno": "deno test --allow-env deno/main_test.ts",
+    "dev": "npx netlify-cli dev",
+    "deploy:netlify": "npx netlify-cli deploy --prod",
+    "deploy:worker": "npx wrangler deploy worker.js"
+  }
+}

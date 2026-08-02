@@ -1,0 +1,22 @@
+# Netlify config for the Bookora OpenAI relay.
+#
+# The function itself declares `config.path = "/ai/*"` (Functions v2), and the
+# redirect below is a belt-and-braces fallback for older Netlify builds. Either
+# way the public base URL the backend should use is:
+#   https://<your-site>.netlify.app/ai/v1
+#
+# ⚠️ Netlify synchronous functions time out at ~10s on the free tier — too short
+# for a full blog-post generation. Prefer Deno Deploy (deno/main.ts).
+
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/ai/*"
+  to = "/.netlify/functions/proxy/:splat"
+  status = 200
+  force = true

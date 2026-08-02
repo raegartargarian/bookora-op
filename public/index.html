@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex" />
+    <title>Bookora OpenAI relay</title>
+    <style>
+      body { font: 15px/1.6 system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #2b2426; }
+      code { background: #f4efec; padding: 0.1rem 0.35rem; border-radius: 0.3rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Bookora OpenAI relay</h1>
+    <p>
+      This site forwards <code>/ai/v1/&lt;path&gt;</code> to
+      <code>https://api.openai.com/v1/&lt;path&gt;</code> and streams the response
+      back untouched. It carries no UI and stores no API key — the key travels in
+      the <code>Authorization</code> header on every request.
+    </p>
+    <p>Health check: <code>/ai/healthz</code></p>
+  </body>
+</html>

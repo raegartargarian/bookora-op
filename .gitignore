@@ -1,0 +1,9 @@
+node_modules/
+.netlify/
+.deno/
+.wrangler/
+dist/
+.DS_Store
+*.log
+.env
+.env.*
