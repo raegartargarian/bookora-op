@@ -49,13 +49,41 @@ identical.
 
 ---
 
+## Where this lives
+
+The proxy is the one piece of Bookora that must sit **outside** Iran, and Deno
+Deploy builds from GitHub — so it is published to a second repository with this
+folder at the root:
+
+| | |
+|---|---|
+| Monorepo (source of truth) | `gitlab.com/bookora/bookora` → `openai-proxy/` |
+| Deploy repo (Deno Deploy watches this) | `github.com/raegartargarian/bookora-op` → root |
+
+Edit here, in the monorepo. The deploy repo is a `git subtree` split, never a
+place to commit into directly — hand-edits there will collide with the next
+split. To publish a change, from the repo root:
+
+```bash
+git subtree push --prefix=openai-proxy proxy main
+```
+
+`proxy` is the GitHub remote (`git@github.com:raegartargarian/bookora-op.git`).
+Because the split is derived from monorepo history, the same commits reproduce
+byte-for-byte every time, and the push stays a fast-forward.
+
+Paths shift by one level across the boundary: `openai-proxy/deno/main.ts` here
+is `deno/main.ts` in the deploy repo, which is the entrypoint Deno Deploy wants.
+
+---
+
 ## Option A — Deno Deploy (recommended)
 
 ### Deploy
 
 1. Sign in with GitHub at <https://dash.deno.com> (no credit card needed).
-2. New Project → deploy `openai-proxy/deno/main.ts` from this Git repo, or from
-   the CLI:
+2. New Project → point it at `github.com/raegartargarian/bookora-op` with
+   entrypoint `deno/main.ts` (see "Where this lives" above), or from the CLI:
    ```bash
    deno install -Arf jsr:@deno/deployctl
    cd openai-proxy/deno && deployctl deploy --project=<name> --entrypoint=main.ts
