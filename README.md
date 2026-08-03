@@ -79,18 +79,58 @@ is `deno/main.ts` in the deploy repo, which is the entrypoint Deno Deploy wants.
 
 ## Option A — Deno Deploy (recommended)
 
+### Live deployment
+
+| | |
+|---|---|
+| Org / app | `raegartargarian` / `bookora-op` |
+| URL | `https://bookora-op.raegartargarian.deno.net` |
+| Region | `eu` |
+| Console | <https://console.deno.com/raegartargarian/bookora-op> |
+
+Verified end to end after deploy: missing `x-proxy-secret` → 403, missing
+`Authorization` → 401, `GET /v1/models` → 200 with 125 models, `POST
+/v1/chat/completions` on `gpt-4.1-mini` → 200, and a model off the allowlist →
+403 `model_not_allowed`.
+
 ### Deploy
 
-1. Sign in with GitHub at <https://dash.deno.com> (no credit card needed).
-2. New Project → point it at `github.com/raegartargarian/bookora-op` with
-   entrypoint `deno/main.ts` (see "Where this lives" above), or from the CLI:
-   ```bash
-   deno install -Arf jsr:@deno/deployctl
-   cd openai-proxy/deno && deployctl deploy --project=<name> --entrypoint=main.ts
-   ```
-3. You get `https://<name>.deno.dev`.
-4. **Add a custom domain** in Project → Settings → Domains (`ai.bookora.ir`) and
-   point a CNAME at it in DNS. Use that hostname below.
+Use the **`deno deploy` subcommand**, not classic `deployctl`. Deno Deploy's
+current platform issues `ddp_` tokens that `deployctl` 1.13 rejects with «the
+bearer token is invalid» — the same token authenticates fine against the new
+CLI. `deno deploy whoami --json` tells you which account you are on.
+
+```bash
+cd openai-proxy/deno
+deno deploy --org raegartargarian --app bookora-op --prod --json --non-interactive
+```
+
+The app was created with:
+
+```bash
+deno deploy create --json --non-interactive --org raegartargarian \
+  --app bookora-op --source local --entrypoint main.ts --region eu
+```
+
+`--source local` uploads this directory, so a deploy does **not** wait on the
+GitHub repo. Push-to-deploy from `github.com/raegartargarian/bookora-op` can be
+wired in the console instead; either way the entrypoint is `main.ts` relative to
+the app directory.
+
+### A custom domain is required for production, not cosmetic
+
+`deno.net` did **not** resolve on the dev machine's resolver during deploy —
+`dig` returned an empty answer, while `8.8.8.8` resolved the same name to
+`69.67.170.170`, and a request forced to that IP completed a TLS handshake and
+returned 200 in ~0.4 s. So the name is blocked at the DNS layer while the
+address itself is reachable.
+
+That is the failure mode `ai.bookora.ir` exists to avoid: a CNAME under a domain
+we control resolves through our own DNS and never asks a resolver about
+`deno.net`. **Add the custom domain in the console and point `ai.bookora.ir` at
+it before the VPS depends on this**, then set `OPENAI_BASE_URL` to
+`https://ai.bookora.ir/v1`. Until then the backend is pointed at the raw
+`.deno.net` hostname, which resolves from some networks and not others.
 
 ### Env vars (Project → Settings → Environment Variables)
 
@@ -102,6 +142,20 @@ is `deno/main.ts` in the deploy repo, which is the entrypoint Deno Deploy wants.
 | `UPSTREAM_TIMEOUT_MS` | no | How long to wait for OpenAI's **response headers**, default `60000`. The timer is cleared the moment headers arrive, so a long streaming generation is never truncated. |
 
 Generate the secret with `openssl rand -hex 32`.
+
+Already set on the live app: `PROXY_SECRET` (stored as a secret, so its value is
+write-only — the API returns `null` for it) and `ALLOWED_MODELS=gpt-4.1,gpt-4.1-mini`,
+which matches the backend's `OPENAI_MODEL=gpt-4.1`. Widening `OPENAI_MODEL` means
+widening `ALLOWED_MODELS` too, or the proxy returns 403 for the new model.
+
+```bash
+deno deploy env add --secret PROXY_SECRET "$(openssl rand -hex 32)" \
+  --org raegartargarian --app bookora-op
+deno deploy env list --org raegartargarian --app bookora-op
+```
+
+Env changes apply to the running revision — the deploy that set `PROXY_SECRET`
+started returning 403 for unauthenticated calls without a rebuild.
 
 ### Test
 

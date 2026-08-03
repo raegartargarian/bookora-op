@@ -24,5 +24,10 @@
     "rules": {
       "tags": ["recommended"]
     }
+  },
+  "deploy": {
+    "org": "raegartargarian",
+    "app": "bookora-op"
   }
 }
+
