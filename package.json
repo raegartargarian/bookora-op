@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.mjs\"",
+    "test": "node --test test/*.test.mjs",
     "test:deno": "deno test --allow-env deno/main_test.ts",
     "dev": "npx netlify-cli dev",
     "deploy:netlify": "npx netlify-cli deploy --prod",
