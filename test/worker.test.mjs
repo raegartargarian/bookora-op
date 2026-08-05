@@ -42,7 +42,7 @@ const okJson = () =>
   });
 
 function post(path, body, headers = {}) {
-  return new Request(`https://ai.bookora.ir${path}`, {
+  return new Request(`https://ai.bookora.net${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: KEY, ...headers },
     body: JSON.stringify(body),
@@ -126,7 +126,7 @@ test('query strings survive and non-/v1 paths 404', async () => {
   const stub = stubFetch(okJson);
   try {
     const ok = await handleRequest(
-      new Request('https://ai.bookora.ir/v1/models?limit=5', {
+      new Request('https://ai.bookora.net/v1/models?limit=5', {
         headers: { authorization: KEY, 'x-proxy-secret': SECRET },
       }),
       { PROXY_SECRET: SECRET },
@@ -135,7 +135,7 @@ test('query strings survive and non-/v1 paths 404', async () => {
     assert.equal(stub.captured[0].url, 'https://api.openai.com/v1/models?limit=5');
 
     const missed = await handleRequest(
-      new Request('https://ai.bookora.ir/admin', {
+      new Request('https://ai.bookora.net/admin', {
         headers: { authorization: KEY, 'x-proxy-secret': SECRET },
       }),
       { PROXY_SECRET: SECRET },
@@ -151,7 +151,7 @@ test('a request without Authorization is rejected with 401', async () => {
   const stub = stubFetch(okJson);
   try {
     const res = await handleRequest(
-      new Request('https://ai.bookora.ir/v1/models', { headers: { 'x-proxy-secret': SECRET } }),
+      new Request('https://ai.bookora.net/v1/models', { headers: { 'x-proxy-secret': SECRET } }),
       { PROXY_SECRET: SECRET },
     );
     assert.equal(res.status, 401);

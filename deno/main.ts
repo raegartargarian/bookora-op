@@ -29,7 +29,7 @@
  *                         cleared so long streaming generations are never cut.
  *
  * Backend wiring:
- *   OPENAI_BASE_URL=https://ai.bookora.ir/v1
+ *   OPENAI_BASE_URL=https://ai.bookora.net/v1
  *   OPENAI_API_KEY=sk-...
  *   OPENAI_PROXY_SECRET=<same value as PROXY_SECRET>
  */

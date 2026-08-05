@@ -3,7 +3,7 @@
  *
  * Functionally identical to `deno/main.ts`. Deploy with `wrangler deploy`, or
  * paste into the dashboard's "Quick edit". `*.workers.dev` is filtered in Iran,
- * so this MUST be routed on a custom domain (e.g. `ai.bookora.ir`).
+ * so this MUST be routed on a custom domain (e.g. `ai.bookora.net`).
  *
  * Secrets / vars (`wrangler secret put …`):
  *   PROXY_SECRET, ALLOWED_MODELS, MAX_BODY_BYTES, UPSTREAM_TIMEOUT_MS

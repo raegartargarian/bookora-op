@@ -52,7 +52,7 @@ function okJson() {
 }
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}) {
-  return new Request(`https://ai.bookora.ir${path}`, {
+  return new Request(`https://ai.bookora.net${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: KEY, ...headers },
     body: JSON.stringify(body),
@@ -155,7 +155,7 @@ Deno.test("query string and method survive the hop", async () => {
   const stub = stubFetch(okJson);
   try {
     const res = await handleRequest(
-      new Request("https://ai.bookora.ir/v1/models?limit=5", {
+      new Request("https://ai.bookora.net/v1/models?limit=5", {
         headers: { authorization: KEY, "x-proxy-secret": SECRET },
       }),
       env({ PROXY_SECRET: SECRET }),
@@ -172,7 +172,7 @@ Deno.test("a non-/v1 path is a 404 and never reaches upstream", async () => {
   const stub = stubFetch(okJson);
   try {
     const res = await handleRequest(
-      new Request("https://ai.bookora.ir/admin", {
+      new Request("https://ai.bookora.net/admin", {
         headers: { authorization: KEY, "x-proxy-secret": SECRET },
       }),
       env({ PROXY_SECRET: SECRET }),
@@ -189,7 +189,7 @@ Deno.test("/healthz answers without the secret and without touching upstream", a
   const stub = stubFetch(okJson);
   try {
     const res = await handleRequest(
-      new Request("https://ai.bookora.ir/healthz"),
+      new Request("https://ai.bookora.net/healthz"),
       env({ PROXY_SECRET: SECRET }),
     );
     assertEquals(res.status, 200);
@@ -222,7 +222,7 @@ Deno.test("a request without Authorization is rejected with 401", async () => {
   const stub = stubFetch(okJson);
   try {
     const res = await handleRequest(
-      new Request("https://ai.bookora.ir/v1/models", {
+      new Request("https://ai.bookora.net/v1/models", {
         headers: { "x-proxy-secret": SECRET },
       }),
       env({ PROXY_SECRET: SECRET }),

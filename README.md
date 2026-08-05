@@ -38,7 +38,7 @@ reports from Iranian networks:
 | Vercel | ❌ | OFAC-blocks Iranian signup. |
 
 **The single biggest reliability lever is a custom domain.** Front whichever host
-you pick with a subdomain of your own domain — `ai.bookora.ir` — so the VPS
+you pick with a subdomain of your own domain — `ai.bookora.net` — so the VPS
 connects to a clean, un-blocklisted hostname instead of a filtered `*.deno.dev` /
 `*.workers.dev` / `*.netlify.app`. Point a CNAME at the host, add the domain in
 the host's dashboard, and use that hostname everywhere below.
@@ -125,11 +125,11 @@ the app directory.
 returned 200 in ~0.4 s. So the name is blocked at the DNS layer while the
 address itself is reachable.
 
-That is the failure mode `ai.bookora.ir` exists to avoid: a CNAME under a domain
+That is the failure mode `ai.bookora.net` exists to avoid: a CNAME under a domain
 we control resolves through our own DNS and never asks a resolver about
-`deno.net`. **Add the custom domain in the console and point `ai.bookora.ir` at
+`deno.net`. **Add the custom domain in the console and point `ai.bookora.net` at
 it before the VPS depends on this**, then set `OPENAI_BASE_URL` to
-`https://ai.bookora.ir/v1`. Until then the backend is pointed at the raw
+`https://ai.bookora.net/v1`. Until then the backend is pointed at the raw
 `.deno.net` hostname, which resolves from some networks and not others.
 
 ### Env vars (Project → Settings → Environment Variables)
@@ -160,7 +160,7 @@ started returning 403 for unauthenticated calls without a rebuild.
 ### Test
 
 ```bash
-curl -sS https://ai.bookora.ir/v1/chat/completions \
+curl -sS https://ai.bookora.net/v1/chat/completions \
   -H "x-proxy-secret: $OPENAI_PROXY_SECRET" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H 'Content-Type: application/json' \
@@ -170,14 +170,14 @@ curl -sS https://ai.bookora.ir/v1/chat/completions \
 Streaming (you should see `data:` chunks arrive one by one, not all at once):
 
 ```bash
-curl -N -sS https://ai.bookora.ir/v1/chat/completions \
+curl -N -sS https://ai.bookora.net/v1/chat/completions \
   -H "x-proxy-secret: $OPENAI_PROXY_SECRET" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4.1-mini","stream":true,"messages":[{"role":"user","content":"یک جمله بنویس"}]}'
 ```
 
-Liveness, no secret needed: `curl https://ai.bookora.ir/healthz` → `{"status":"ok",…}`.
+Liveness, no secret needed: `curl https://ai.bookora.net/healthz` → `{"status":"ok",…}`.
 
 ---
 
@@ -188,10 +188,10 @@ Liveness, no secret needed: `curl https://ai.bookora.ir/healthz` → `{"status":
 1. `npm i -g wrangler && wrangler login` (or paste the file into the dashboard's
    "Quick edit").
 2. `npx wrangler deploy worker.js`, then add a **route on a custom domain** —
-   `*.workers.dev` is filtered in Iran, so use `ai.bookora.ir`.
+   `*.workers.dev` is filtered in Iran, so use `ai.bookora.net`.
 3. `wrangler secret put PROXY_SECRET` (and optionally set `ALLOWED_MODELS`,
    `MAX_BODY_BYTES`, `UPSTREAM_TIMEOUT_MS` as vars).
-4. Backend: `OPENAI_BASE_URL=https://ai.bookora.ir/v1` — no path prefix.
+4. Backend: `OPENAI_BASE_URL=https://ai.bookora.net/v1` — no path prefix.
 
 Same curl test as above.
 
@@ -225,7 +225,7 @@ unblock development, and prefer Deno Deploy for production.
 `backend/.env` (validated in `backend/src/config/env.schema.ts`):
 
 ```ini
-OPENAI_BASE_URL=https://ai.bookora.ir/v1     # this proxy, INCLUDING /v1
+OPENAI_BASE_URL=https://ai.bookora.net/v1     # this proxy, INCLUDING /v1
 OPENAI_API_KEY=sk-proj-...                   # the real OpenAI key — only the VPS holds it
 OPENAI_PROXY_SECRET=<same value as PROXY_SECRET on the proxy>
 OPENAI_MODEL=gpt-4.1-mini                    # default model for blog/SEO generation
