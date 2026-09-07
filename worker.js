@@ -6,7 +6,10 @@
  * so this MUST be routed on a custom domain (e.g. `ai.bookora.net`).
  *
  * Secrets / vars (`wrangler secret put …`):
- *   PROXY_SECRET, ALLOWED_MODELS, MAX_BODY_BYTES, UPSTREAM_TIMEOUT_MS
+ *   PROXY_SECRET (REQUIRED — the guard fails closed; without it every request is
+ *   refused with 503 and /healthz reports `misconfigured`, because a relay that
+ *   serves without a secret is an open relay to api.openai.com on our hostname),
+ *   ALLOWED_MODELS, MAX_BODY_BYTES, UPSTREAM_TIMEOUT_MS
  *
  * No OpenAI key lives here: it arrives in the `Authorization` header from the
  * backend on every request and is forwarded untouched.
@@ -46,6 +49,34 @@ export function safeEqual(a, b) {
     diff |= (left[i] ?? 0) ^ (right[i] ?? 0);
   }
   return diff === 0;
+}
+
+/**
+ * Read the shared secret, treating unset/blank as unset.
+ *
+ * The guard **fails closed**. It used to be `if (env.PROXY_SECRET && !safeEqual(...))`,
+ * which meant a deploy that forgot the variable relayed for anyone who found the
+ * hostname. Refusing to serve is strictly better than serving unauthenticated:
+ * the operator sees a dead relay immediately, instead of an OpenAI bill later.
+ */
+export function configuredSecret(raw) {
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw : null;
+}
+
+const MISCONFIGURED_MESSAGE =
+  'This relay is not configured: PROXY_SECRET is unset. It refuses to serve rather than ' +
+  'act as an open relay to api.openai.com.';
+
+let warnedUnconfigured = false;
+
+/** Loud once per instance rather than silent on every request. */
+export function warnIfUnconfigured(env) {
+  const configured = configuredSecret(env?.PROXY_SECRET) !== null;
+  if (!configured && !warnedUnconfigured) {
+    warnedUnconfigured = true;
+    console.error(`[bookora-openai-proxy] FATAL: ${MISCONFIGURED_MESSAGE}`);
+  }
+  return configured;
 }
 
 /** An OpenAI-shaped error body, so the backend's error handling still works. */
@@ -111,11 +142,25 @@ export async function handleRequest(request, env) {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
   }
+
+  const secret = configuredSecret(env?.PROXY_SECRET);
+  if (secret === null) warnIfUnconfigured(env);
+
+  // The health check is the deployment's own alarm: it must not answer "ok"
+  // while the guard is disabled, or the misconfiguration stays invisible.
   if (url.pathname === '/healthz') {
-    return Response.json({ status: 'ok', upstream: UPSTREAM_ORIGIN });
+    return secret === null
+      ? Response.json(
+          { status: 'misconfigured', upstream: UPSTREAM_ORIGIN, error: MISCONFIGURED_MESSAGE },
+          { status: 503, headers: { 'cache-control': 'no-store' } },
+        )
+      : Response.json({ status: 'ok', upstream: UPSTREAM_ORIGIN });
   }
 
-  if (env.PROXY_SECRET && !safeEqual(request.headers.get('x-proxy-secret'), env.PROXY_SECRET)) {
+  if (secret === null) {
+    return apiError(503, MISCONFIGURED_MESSAGE, 'proxy_not_configured');
+  }
+  if (!safeEqual(request.headers.get('x-proxy-secret'), secret)) {
     return apiError(403, 'Forbidden: missing or invalid x-proxy-secret.', 'invalid_proxy_secret');
   }
 

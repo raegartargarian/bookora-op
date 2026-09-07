@@ -276,3 +276,63 @@ test('the Netlify build behaves identically behind its /ai prefix', async () => 
     stub.restore();
   }
 });
+
+// --- fail closed on a missing PROXY_SECRET ---------------------------------
+//
+// The guard used to be `if (env.PROXY_SECRET && !safeEqual(...))`, so a deploy
+// that forgot the variable served EVERY caller: an open, anonymising relay to
+// api.openai.com on our hostname, at a public Deno Deploy URL. The relay now
+// refuses to serve at all rather than serve unauthenticated.
+
+test('an unset PROXY_SECRET refuses to serve instead of relaying (worker)', async () => {
+  const stub = stubFetch(okJson);
+  try {
+    for (const env of [{}, { PROXY_SECRET: '' }, { PROXY_SECRET: '   ' }]) {
+      const res = await handleRequest(
+        post('/v1/chat/completions', { model: 'gpt-4.1-mini' }, { 'x-proxy-secret': SECRET }),
+        env,
+      );
+      assert.equal(res.status, 503);
+      assert.equal((await res.json()).error.code, 'proxy_not_configured');
+    }
+    assert.equal(stub.captured.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('an unset PROXY_SECRET refuses to serve instead of relaying (netlify)', async () => {
+  const stub = stubFetch(okJson);
+  try {
+    const res = await netlifyHandleRequest(
+      post('/ai/v1/chat/completions', { model: 'gpt-4.1-mini' }, { 'x-proxy-secret': SECRET }),
+      {},
+    );
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error.code, 'proxy_not_configured');
+    assert.equal(stub.captured.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('/healthz reports the misconfiguration loudly instead of answering ok', async () => {
+  const healthy = await handleRequest(new Request('https://ai.bookora.net/healthz'), {
+    PROXY_SECRET: SECRET,
+  });
+  assert.equal(healthy.status, 200);
+  assert.equal((await healthy.json()).status, 'ok');
+
+  const broken = await handleRequest(new Request('https://ai.bookora.net/healthz'), {});
+  assert.equal(broken.status, 503);
+  const body = await broken.json();
+  assert.equal(body.status, 'misconfigured');
+  assert.match(body.error, /PROXY_SECRET/);
+
+  const brokenNetlify = await netlifyHandleRequest(
+    new Request('https://site.netlify.app/ai/healthz'),
+    {},
+  );
+  assert.equal(brokenNetlify.status, 503);
+  assert.equal((await brokenNetlify.json()).status, 'misconfigured');
+});

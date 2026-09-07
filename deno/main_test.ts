@@ -1,5 +1,5 @@
 /**
- * Tests for the Deno relay: path forwarding and the secret guard.
+ * Tests for the Deno relay: path forwarding and the fail-closed secret guard.
  *
  * Run with `deno task test` (from this folder) or
  * `deno test --allow-env openai-proxy/deno/main_test.ts`.
@@ -138,15 +138,33 @@ Deno.test("secret guard passes with the right header and forwards upstream", asy
   }
 });
 
-Deno.test("no PROXY_SECRET configured means no guard", async () => {
+// The guard used to be `if (secret && !safeEqual(...))`, so a deploy that forgot
+// the variable served EVERY caller: an open, anonymising relay to api.openai.com
+// on our hostname, at a public Deno Deploy URL. It now fails CLOSED.
+Deno.test("an unset PROXY_SECRET refuses to serve instead of relaying", async () => {
   const stub = stubFetch(okJson);
   try {
-    const res = await handleRequest(post("/v1/models", {}), env());
-    assertEquals(res.status, 200);
-    assertEquals(stub.captured.length, 1);
+    const cases: Record<string, string>[] = [{}, { PROXY_SECRET: "" }, { PROXY_SECRET: "   " }];
+    for (const vars of cases) {
+      const res = await handleRequest(
+        post("/v1/models", {}, { "x-proxy-secret": SECRET }),
+        env(vars),
+      );
+      assertEquals(res.status, 503);
+      assertEquals((await res.json()).error.code, "proxy_not_configured");
+    }
+    assertEquals(stub.captured.length, 0);
   } finally {
     stub.restore();
   }
+});
+
+Deno.test("/healthz reports the misconfiguration loudly instead of answering ok", async () => {
+  const res = await handleRequest(new Request("https://ai.bookora.net/healthz"), env());
+  assertEquals(res.status, 503);
+  const body = await res.json();
+  assertEquals(body.status, "misconfigured");
+  assert(String(body.error).includes("PROXY_SECRET"));
 });
 
 // --- path forwarding -------------------------------------------------------

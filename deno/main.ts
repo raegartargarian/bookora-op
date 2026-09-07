@@ -21,7 +21,12 @@
  *   - or CLI:  deployctl deploy --project=<name> openai-proxy/deno/main.ts
  *
  * Env vars to set in the Deno project:
- *   - PROXY_SECRET        required guard; matches OPENAI_PROXY_SECRET on the backend
+ *   - PROXY_SECRET        REQUIRED guard; matches OPENAI_PROXY_SECRET on the
+ *                         backend. The guard fails CLOSED: without it the relay
+ *                         refuses every request with 503 and `/healthz` reports
+ *                         `misconfigured`, because a relay that serves without a
+ *                         secret is an open relay to api.openai.com on our
+ *                         hostname.
  *   - ALLOWED_MODELS      optional comma-separated model allowlist (e.g. gpt-4.1-mini,gpt-4.1)
  *   - MAX_BODY_BYTES      optional request-body cap (default 2097152 = 2 MiB)
  *   - UPSTREAM_TIMEOUT_MS optional time to wait for upstream response HEADERS
@@ -86,6 +91,35 @@ export function safeEqual(a: unknown, b: unknown): boolean {
 }
 
 /** An OpenAI-shaped error body, so the backend's error handling still works. */
+/**
+ * Read the shared secret, treating unset/blank as unset.
+ *
+ * The guard **fails closed**. It used to be `if (secret && !safeEqual(...))`,
+ * which meant a deploy that forgot the variable relayed for anyone who found
+ * the hostname — and the deploy target is a public Deno Deploy URL. Refusing to
+ * serve is strictly better than serving unauthenticated: the operator sees a
+ * dead relay immediately, instead of an OpenAI bill later.
+ */
+export function configuredSecret(raw: string | undefined): string | null {
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
+}
+
+const MISCONFIGURED_MESSAGE =
+  "This relay is not configured: PROXY_SECRET is unset. It refuses to serve rather than " +
+  "act as an open relay to api.openai.com.";
+
+let warnedUnconfigured = false;
+
+/** Loud once per instance rather than silent on every request. */
+export function warnIfUnconfigured(env: EnvSource): boolean {
+  const configured = configuredSecret(env.get("PROXY_SECRET")) !== null;
+  if (!configured && !warnedUnconfigured) {
+    warnedUnconfigured = true;
+    console.error(`[bookora-openai-proxy] FATAL: ${MISCONFIGURED_MESSAGE}`);
+  }
+  return configured;
+}
+
 export function apiError(
   status: number,
   message: string,
@@ -170,12 +204,25 @@ export async function handleRequest(request: Request, env: EnvSource): Promise<R
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
+
+  const secret = configuredSecret(env.get("PROXY_SECRET"));
+  if (secret === null) warnIfUnconfigured(env);
+
+  // The health check is the deployment's own alarm: it must not answer "ok"
+  // while the guard is disabled, or the misconfiguration stays invisible.
   if (url.pathname === "/healthz") {
-    return Response.json({ status: "ok", upstream: UPSTREAM_ORIGIN });
+    return secret === null
+      ? Response.json(
+        { status: "misconfigured", upstream: UPSTREAM_ORIGIN, error: MISCONFIGURED_MESSAGE },
+        { status: 503, headers: { "cache-control": "no-store" } },
+      )
+      : Response.json({ status: "ok", upstream: UPSTREAM_ORIGIN });
   }
 
-  const secret = env.get("PROXY_SECRET");
-  if (secret && !safeEqual(request.headers.get("x-proxy-secret"), secret)) {
+  if (secret === null) {
+    return apiError(503, MISCONFIGURED_MESSAGE, "proxy_not_configured");
+  }
+  if (!safeEqual(request.headers.get("x-proxy-secret"), secret)) {
     return apiError(403, "Forbidden: missing or invalid x-proxy-secret.", "invalid_proxy_secret");
   }
 
@@ -268,5 +315,7 @@ export async function handleRequest(request: Request, env: EnvSource): Promise<R
 }
 
 if (import.meta.main) {
+  // Fail loudly at startup rather than silently on every request.
+  warnIfUnconfigured(Deno.env);
   Deno.serve((request) => handleRequest(request, Deno.env));
 }

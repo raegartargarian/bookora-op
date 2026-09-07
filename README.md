@@ -136,7 +136,7 @@ it before the VPS depends on this**, then set `OPENAI_BASE_URL` to
 
 | Var | Required | Meaning |
 |---|---|---|
-| `PROXY_SECRET` | **yes** | Shared guard. Must match `OPENAI_PROXY_SECRET` on the backend. Sent as the `x-proxy-secret` header. Without it, anyone who finds the hostname can burn your quota with *their* key — or point their traffic at you. |
+| `PROXY_SECRET` | **yes — the guard fails closed** | Shared guard. Must match `OPENAI_PROXY_SECRET` on the backend. Sent as the `x-proxy-secret` header. If it is unset or blank the relay refuses every request with **503 `proxy_not_configured`**, logs `[bookora-openai-proxy] FATAL` once, and `/healthz` answers **503 `misconfigured`** — it never serves unauthenticated. Serving without it would be an open, anonymising relay to `api.openai.com` on our hostname, at a public URL. |
 | `ALLOWED_MODELS` | no | Comma-separated model allowlist, e.g. `gpt-4.1-mini,gpt-4.1`. When set, a JSON body whose `model` is not on the list gets 403. Leave unset to allow every model. |
 | `MAX_BODY_BYTES` | no | Request-body cap, default `2097152` (2 MiB). Over the cap → 413. |
 | `UPSTREAM_TIMEOUT_MS` | no | How long to wait for OpenAI's **response headers**, default `60000`. The timer is cleared the moment headers arrive, so a long streaming generation is never truncated. |
@@ -178,6 +178,9 @@ curl -N -sS https://ai.bookora.net/v1/chat/completions \
 ```
 
 Liveness, no secret needed: `curl https://ai.bookora.net/healthz` → `{"status":"ok",…}`.
+It is also the misconfiguration alarm: with `PROXY_SECRET` unset it answers **503**
+`{"status":"misconfigured",…}`, so an uptime ping catches the open-relay case
+before a bill does.
 
 ---
 
@@ -254,14 +257,14 @@ nothing else changes.
 | Concern | Behaviour |
 |---|---|
 | Path | Forwards from the first `/v1/` segment onward, verbatim, plus the query string. Works whether the host hands over `/v1/…`, `/ai/v1/…` or `/.netlify/functions/proxy/v1/…`. Anything else → 404. |
-| Guard | `x-proxy-secret` compared in constant time against `PROXY_SECRET`. Mismatch → 403 before any upstream call. The header is stripped and never reaches OpenAI. |
+| Guard | `x-proxy-secret` compared in constant time against `PROXY_SECRET`. Mismatch → 403 before any upstream call. The header is stripped and never reaches OpenAI. **Fails closed**: an unset/blank `PROXY_SECRET` → 503 `proxy_not_configured` for every request, never a pass-through. |
 | Key | `Authorization` is forwarded untouched. Missing → 401 `missing_authorization`. Nothing is stored. |
 | Request headers | Allowlisted: `authorization`, `content-type`, `accept`, `openai-organization`, `openai-project`, `openai-beta`, `idempotency-key`, `user-agent`. `host`/`x-forwarded-*` never leak upstream. |
 | Request body | Raw bytes (`arrayBuffer`, never `.text()`), so multipart/binary uploads survive. Capped at `MAX_BODY_BYTES` → 413. |
 | Response | `ReadableStream` passed straight through — no buffering, no re-encoding. Upstream `content-type` is preserved (so `text/event-stream` stays SSE), plus `cache-control: no-cache, no-transform` and `x-accel-buffering: no` to stop any proxy in the path from buffering. Stale `content-encoding`/`content-length` are dropped, since the runtime already decoded the body. |
 | Status & errors | Upstream status and OpenAI's error JSON are relayed verbatim, so the backend's existing 401/429/400 handling still works. |
 | Timeouts | `UPSTREAM_TIMEOUT_MS` bounds the wait for response **headers** only; once they arrive the timer is cleared so long generations stream to completion. Timeout → 504 `upstream_timeout`; connection failure → 502 `upstream_unreachable`. |
-| Proxy's own errors | Always OpenAI-shaped: `{"error":{"message":"…","type":"proxy_error","param":null,"code":"…"}}`. Codes: `invalid_proxy_secret`, `unknown_path`, `missing_authorization`, `payload_too_large`, `model_not_allowed`, `upstream_timeout`, `upstream_unreachable`. |
+| Proxy's own errors | Always OpenAI-shaped: `{"error":{"message":"…","type":"proxy_error","param":null,"code":"…"}}`. Codes: `proxy_not_configured`, `invalid_proxy_secret`, `unknown_path`, `missing_authorization`, `payload_too_large`, `model_not_allowed`, `upstream_timeout`, `upstream_unreachable`. |
 
 ---
 
