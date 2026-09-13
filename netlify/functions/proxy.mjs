@@ -3,8 +3,12 @@
  * Request/Response so streaming works).
  *
  * ⚠️ Netlify's synchronous functions time out at ~10s on the free tier, which
- * is not enough for a blog-post generation. Use this only as a fallback, and
- * prefer Deno Deploy (`deno/main.ts`). See README.
+ * is not enough for a synchronous blog-post generation. The backend now uses
+ * the Responses API in background mode instead: `POST /v1/responses` returns an
+ * id, `GET /v1/responses/{id}` is polled, `POST /v1/responses/{id}/cancel` is
+ * sent on a deadline, and each of those answers in well under 9s — so Netlify
+ * is viable for polling. Reachability from Iran is still unreliable, and Deno
+ * Deploy (`deno/main.ts`) remains the recommended host. See README.
  *
  * Routed at `/ai/*` (see `config` below and `netlify.toml`), so the backend's
  * base URL includes the `/ai` prefix:
@@ -12,14 +16,15 @@
  *
  * Site env vars: PROXY_SECRET (REQUIRED — the guard fails closed; without it
  * every request is refused with 503 and /healthz reports `misconfigured`),
- * ALLOWED_MODELS, MAX_BODY_BYTES,
- * UPSTREAM_TIMEOUT_MS. No OpenAI key lives here — it arrives in the
+ * ALLOWED_MODELS (exact ids or `prefix*`; must list both the primary and the
+ * fallback model, e.g. `gpt-5*,gpt-4.1`), MAX_BODY_BYTES,
+ * UPSTREAM_TIMEOUT_MS (time to headers, default 9000). No OpenAI key lives here — it arrives in the
  * `Authorization` header from the backend and is forwarded untouched.
  */
 const UPSTREAM_ORIGIN = 'https://api.openai.com';
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 9_000; // stay inside Netlify's ~10s sync budget
+export const DEFAULT_TIMEOUT_MS = 9_000; // stay inside Netlify's ~10s sync budget
 
 const FORWARDED_REQUEST_HEADERS = [
   'authorization',
@@ -112,6 +117,30 @@ export function parseAllowedModels(raw) {
   return new Set(raw.split(',').map((entry) => entry.trim()).filter(Boolean));
 }
 
+/**
+ * Whether `model` passes the allowlist. An empty allowlist allows everything.
+ * Entries match exactly, except an entry ending in `*`, which matches any id
+ * starting with the text before it — so `gpt-5*` admits dated snapshots and the
+ * `-mini` variant without also admitting `gpt-4.1-mini`. The prefix is literal,
+ * so keep it specific.
+ */
+export function isModelAllowed(model, allowed) {
+  if (allowed.size === 0) return true;
+  for (const entry of allowed) {
+    if (entry.endsWith('*')) {
+      if (model.startsWith(entry.slice(0, -1))) return true;
+    } else if (entry === model) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Read `model` out of a JSON body, or `null` when there is none (`/v1/models`,
+ * a background poll `GET /v1/responses/{id}`, its body-less `POST …/cancel`) —
+ * those are let through untouched.
+ */
 export function extractModel(bodyBytes, contentType) {
   if (!bodyBytes || bodyBytes.byteLength === 0) return null;
   if (!contentType || !contentType.toLowerCase().includes('json')) return null;
@@ -185,7 +214,7 @@ export async function handleRequest(request, env = process.env) {
   const allowedModels = parseAllowedModels(env.ALLOWED_MODELS);
   if (allowedModels.size > 0) {
     const model = extractModel(bodyBytes, request.headers.get('content-type'));
-    if (model && !allowedModels.has(model)) {
+    if (model && !isModelAllowed(model, allowedModels)) {
       return apiError(403, `Model '${model}' is not allowed by this proxy.`, 'model_not_allowed');
     }
   }

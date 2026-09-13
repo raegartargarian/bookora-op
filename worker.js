@@ -9,7 +9,13 @@
  *   PROXY_SECRET (REQUIRED — the guard fails closed; without it every request is
  *   refused with 503 and /healthz reports `misconfigured`, because a relay that
  *   serves without a secret is an open relay to api.openai.com on our hostname),
- *   ALLOWED_MODELS, MAX_BODY_BYTES, UPSTREAM_TIMEOUT_MS
+ *   ALLOWED_MODELS (exact ids or `prefix*`; must list both the primary and the
+ *   fallback model, e.g. `gpt-5*,gpt-4.1`), MAX_BODY_BYTES, UPSTREAM_TIMEOUT_MS
+ *   (time to response HEADERS only, default 120000).
+ *
+ * The backend uses the Responses API in background mode — `POST /v1/responses`,
+ * then polls `GET /v1/responses/{id}` and may `POST /v1/responses/{id}/cancel` —
+ * so every exchange is short. Any `/v1/*` path and method is forwarded as-is.
  *
  * No OpenAI key lives here: it arrives in the `Authorization` header from the
  * backend on every request and is forwarded untouched.
@@ -17,7 +23,7 @@
 const UPSTREAM_ORIGIN = 'https://api.openai.com';
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_TIMEOUT_MS = 120_000;
 
 const FORWARDED_REQUEST_HEADERS = [
   'authorization',
@@ -108,6 +114,30 @@ export function parseAllowedModels(raw) {
   return new Set(raw.split(',').map((entry) => entry.trim()).filter(Boolean));
 }
 
+/**
+ * Whether `model` passes the allowlist. An empty allowlist allows everything.
+ * Entries match exactly, except an entry ending in `*`, which matches any id
+ * starting with the text before it — so `gpt-5*` admits dated snapshots and the
+ * `-mini` variant without also admitting `gpt-4.1-mini`. The prefix is literal,
+ * so keep it specific.
+ */
+export function isModelAllowed(model, allowed) {
+  if (allowed.size === 0) return true;
+  for (const entry of allowed) {
+    if (entry.endsWith('*')) {
+      if (model.startsWith(entry.slice(0, -1))) return true;
+    } else if (entry === model) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Read `model` out of a JSON body, or `null` when there is none (`/v1/models`,
+ * a background poll `GET /v1/responses/{id}`, its body-less `POST …/cancel`) —
+ * those are let through untouched.
+ */
 export function extractModel(bodyBytes, contentType) {
   if (!bodyBytes || bodyBytes.byteLength === 0) return null;
   if (!contentType || !contentType.toLowerCase().includes('json')) return null;
@@ -196,7 +226,7 @@ export async function handleRequest(request, env) {
   const allowedModels = parseAllowedModels(env.ALLOWED_MODELS);
   if (allowedModels.size > 0) {
     const model = extractModel(bodyBytes, request.headers.get('content-type'));
-    if (model && !allowedModels.has(model)) {
+    if (model && !isModelAllowed(model, allowedModels)) {
       return apiError(403, `Model '${model}' is not allowed by this proxy.`, 'model_not_allowed');
     }
   }

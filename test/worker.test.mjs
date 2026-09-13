@@ -9,13 +9,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import worker, {
+  DEFAULT_TIMEOUT_MS,
   extractModel,
   handleRequest,
+  isModelAllowed,
   parseAllowedModels,
   resolveUpstreamPath,
   safeEqual,
 } from '../worker.js';
-import { handleRequest as netlifyHandleRequest } from '../netlify/functions/proxy.mjs';
+import {
+  DEFAULT_TIMEOUT_MS as NETLIFY_DEFAULT_TIMEOUT_MS,
+  handleRequest as netlifyHandleRequest,
+  isModelAllowed as netlifyIsModelAllowed,
+} from '../netlify/functions/proxy.mjs';
 
 const SECRET = 's3cret-value';
 const KEY = 'Bearer sk-test-key';
@@ -335,4 +341,128 @@ test('/healthz reports the misconfiguration loudly instead of answering ok', asy
   );
   assert.equal(brokenNetlify.status, 503);
   assert.equal((await brokenNetlify.json()).status, 'misconfigured');
+});
+
+// --- Responses API, background polling -------------------------------------
+//
+// The backend creates a background response, polls it by id and may cancel it.
+// The poll and the cancel carry no model, so the allowlist must let them through;
+// the create carries the alias, which a `prefix*` entry has to admit.
+
+const RESPONSES_ALLOWLIST = 'gpt-5*,gpt-4.1';
+
+test('isModelAllowed matches exact entries and trailing-* prefixes only', () => {
+  for (const check of [isModelAllowed, netlifyIsModelAllowed]) {
+    const allowed = parseAllowedModels(RESPONSES_ALLOWLIST);
+    assert.equal(check('gpt-5', allowed), true);
+    assert.equal(check('gpt-5-mini', allowed), true);
+    assert.equal(check('gpt-5-2025-08-07', allowed), true);
+    assert.equal(check('gpt-4.1', allowed), true);
+    // An exact entry is not a prefix, and a wildcard never leaks to another family.
+    assert.equal(check('gpt-4.1-mini', allowed), false);
+    assert.equal(check('gpt-4.1-2025-04-14', allowed), false);
+    assert.equal(check('o3-pro', allowed), false);
+    assert.equal(check('gpt-4o', allowed), false);
+    // No allowlist configured: everything passes.
+    assert.equal(check('anything', parseAllowedModels(undefined)), true);
+  }
+});
+
+test('the default header timeout is 120s (worker) and stays 9s (netlify)', () => {
+  assert.equal(DEFAULT_TIMEOUT_MS, 120000);
+  assert.equal(NETLIFY_DEFAULT_TIMEOUT_MS, 9000);
+});
+
+test('a background create on gpt-5 passes a gpt-5* allowlist', async () => {
+  const stub = stubFetch(() => Response.json({ id: 'resp_abc', status: 'queued' }));
+  try {
+    const res = await handleRequest(
+      post(
+        '/v1/responses',
+        { model: 'gpt-5', background: true, store: true },
+        { 'x-proxy-secret': SECRET },
+      ),
+      { PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST },
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).status, 'queued');
+    assert.equal(stub.captured.length, 1);
+    assert.equal(stub.captured[0].url, 'https://api.openai.com/v1/responses');
+    assert.equal(stub.captured[0].init.method, 'POST');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a body-less poll GET /v1/responses/{id} is forwarded under an allowlist', async () => {
+  const stub = stubFetch(() => Response.json({ id: 'resp_abc', status: 'in_progress' }));
+  try {
+    const res = await handleRequest(
+      new Request('https://ai.bookora.net/v1/responses/resp_abc', {
+        headers: { authorization: KEY, 'x-proxy-secret': SECRET, accept: 'application/json' },
+      }),
+      { PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(stub.captured.length, 1);
+    assert.equal(stub.captured[0].url, 'https://api.openai.com/v1/responses/resp_abc');
+    assert.equal(stub.captured[0].init.method, 'GET');
+    assert.equal(stub.captured[0].init.body, undefined);
+    assert.equal(stub.captured[0].init.headers.get('authorization'), KEY);
+    assert.equal(stub.captured[0].init.headers.get('x-proxy-secret'), null);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('an empty-body cancel POST is forwarded under an allowlist', async () => {
+  const stub = stubFetch(() => Response.json({ id: 'resp_abc', status: 'cancelled' }));
+  try {
+    const res = await handleRequest(
+      new Request('https://ai.bookora.net/v1/responses/resp_abc/cancel', {
+        method: 'POST',
+        headers: { authorization: KEY, 'x-proxy-secret': SECRET, accept: 'application/json' },
+      }),
+      { PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(stub.captured.length, 1);
+    assert.equal(stub.captured[0].url, 'https://api.openai.com/v1/responses/resp_abc/cancel');
+    assert.equal(stub.captured[0].init.method, 'POST');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('gpt-4.1-mini is refused by a gpt-5*,gpt-4.1 allowlist (worker and netlify)', async () => {
+  const stub = stubFetch(okJson);
+  const env = { PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST };
+  try {
+    const body = { model: 'gpt-4.1-mini', background: true };
+    const res = await handleRequest(
+      post('/v1/responses', body, { 'x-proxy-secret': SECRET }),
+      env,
+    );
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error.code, 'model_not_allowed');
+
+    const viaNetlify = await netlifyHandleRequest(
+      post('/ai/v1/responses', body, { 'x-proxy-secret': SECRET }),
+      env,
+    );
+    assert.equal(viaNetlify.status, 403);
+    assert.equal((await viaNetlify.json()).error.code, 'model_not_allowed');
+    assert.equal(stub.captured.length, 0);
+
+    const poll = await netlifyHandleRequest(
+      new Request('https://x.netlify.app/ai/v1/responses/resp_abc', {
+        headers: { authorization: KEY, 'x-proxy-secret': SECRET },
+      }),
+      env,
+    );
+    assert.equal(poll.status, 200);
+    assert.equal(stub.captured[0].url, 'https://api.openai.com/v1/responses/resp_abc');
+  } finally {
+    stub.restore();
+  }
 });

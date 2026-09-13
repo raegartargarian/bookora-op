@@ -9,8 +9,10 @@
  */
 import { assert, assertEquals } from "jsr:@std/assert@^1.0.8";
 import {
+  DEFAULT_TIMEOUT_MS,
   extractModel,
   handleRequest,
+  isModelAllowed,
   parseAllowedModels,
   resolveUpstreamPath,
   safeEqual,
@@ -361,5 +363,109 @@ Deno.test("an unreachable upstream becomes a 502 with a clear body", async () =>
     assert(body.error.message.includes("dns failure"));
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+// --- Responses API, background polling -------------------------------------
+//
+// The backend creates a background response, polls it by id and may cancel it.
+// The poll and the cancel carry no model, so the allowlist must let them through;
+// the create carries the alias, which a `prefix*` entry has to admit.
+
+const RESPONSES_ALLOWLIST = "gpt-5*,gpt-4.1";
+
+Deno.test("isModelAllowed matches exact entries and trailing-* prefixes only", () => {
+  const allowed = parseAllowedModels(RESPONSES_ALLOWLIST);
+  assert(isModelAllowed("gpt-5", allowed));
+  assert(isModelAllowed("gpt-5-mini", allowed));
+  assert(isModelAllowed("gpt-5-2025-08-07", allowed));
+  assert(isModelAllowed("gpt-4.1", allowed));
+  // An exact entry is not a prefix, and a wildcard never leaks to another family.
+  assert(!isModelAllowed("gpt-4.1-mini", allowed));
+  assert(!isModelAllowed("gpt-4.1-2025-04-14", allowed));
+  assert(!isModelAllowed("o3-pro", allowed));
+  assert(!isModelAllowed("gpt-4o", allowed));
+  // No allowlist configured: everything passes.
+  assert(isModelAllowed("anything", parseAllowedModels(undefined)));
+});
+
+Deno.test("the default header timeout is 120s", () => {
+  assertEquals(DEFAULT_TIMEOUT_MS, 120000);
+});
+
+Deno.test("a background create on gpt-5 passes a gpt-5* allowlist", async () => {
+  const stub = stubFetch(() => Response.json({ id: "resp_abc", status: "queued" }));
+  try {
+    const res = await handleRequest(
+      post("/v1/responses", { model: "gpt-5", background: true, store: true }, {
+        "x-proxy-secret": SECRET,
+      }),
+      env({ PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals((await res.json()).status, "queued");
+    assertEquals(stub.captured.length, 1);
+    assertEquals(stub.captured[0].url, "https://api.openai.com/v1/responses");
+    assertEquals(stub.captured[0].init.method, "POST");
+  } finally {
+    stub.restore();
+  }
+});
+
+Deno.test("a body-less poll GET /v1/responses/{id} is forwarded under an allowlist", async () => {
+  const stub = stubFetch(() => Response.json({ id: "resp_abc", status: "in_progress" }));
+  try {
+    const res = await handleRequest(
+      new Request("https://ai.bookora.net/v1/responses/resp_abc", {
+        headers: { authorization: KEY, "x-proxy-secret": SECRET, accept: "application/json" },
+      }),
+      env({ PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(stub.captured.length, 1);
+    assertEquals(stub.captured[0].url, "https://api.openai.com/v1/responses/resp_abc");
+    assertEquals(stub.captured[0].init.method, "GET");
+    assertEquals(stub.captured[0].init.body, undefined);
+    const headers = stub.captured[0].init.headers as Headers;
+    assertEquals(headers.get("authorization"), KEY);
+    assertEquals(headers.get("x-proxy-secret"), null);
+  } finally {
+    stub.restore();
+  }
+});
+
+Deno.test("an empty-body cancel POST is forwarded under an allowlist", async () => {
+  const stub = stubFetch(() => Response.json({ id: "resp_abc", status: "cancelled" }));
+  try {
+    const res = await handleRequest(
+      new Request("https://ai.bookora.net/v1/responses/resp_abc/cancel", {
+        method: "POST",
+        headers: { authorization: KEY, "x-proxy-secret": SECRET, accept: "application/json" },
+      }),
+      env({ PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST }),
+    );
+    assertEquals(res.status, 200);
+    assertEquals(stub.captured.length, 1);
+    assertEquals(stub.captured[0].url, "https://api.openai.com/v1/responses/resp_abc/cancel");
+    assertEquals(stub.captured[0].init.method, "POST");
+  } finally {
+    stub.restore();
+  }
+});
+
+Deno.test("gpt-4.1-mini is refused by a gpt-5*,gpt-4.1 allowlist", async () => {
+  const stub = stubFetch(okJson);
+  try {
+    const res = await handleRequest(
+      post("/v1/responses", { model: "gpt-4.1-mini", background: true }, {
+        "x-proxy-secret": SECRET,
+      }),
+      env({ PROXY_SECRET: SECRET, ALLOWED_MODELS: RESPONSES_ALLOWLIST }),
+    );
+    assertEquals(res.status, 403);
+    assertEquals((await res.json()).error.code, "model_not_allowed");
+    assertEquals(stub.captured.length, 0);
+  } finally {
+    stub.restore();
   }
 });

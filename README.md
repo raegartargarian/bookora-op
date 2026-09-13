@@ -32,9 +32,9 @@ reports from Iranian networks:
 
 | Host | Reachable from Iran? | Notes |
 |------|----------------------|-------|
-| **Deno Deploy** (`deno.dev`) | ✅ **Best** | No filtering reports; GitHub signup (no card → sidesteps sanctions). Streams fine, no hard request timeout. **Recommended.** |
+| **Deno Deploy** (`deno.dev`) | ✅ **Best** | No filtering reports; GitHub signup (no card → sidesteps sanctions). Streams fine. A hard ~120s request cutoff was observed on a sibling project, which background polling sidesteps (see below). **Recommended.** |
 | Cloudflare Worker | ⚠️ only on a **custom domain** | `*.workers.dev` is filtered in Iran since 2023; free-Worker limits tightened in 2025. Streaming works. |
-| Netlify | ❌ risky | Documented "not accessible from Iran" reports, **and** synchronous functions time out at ~10s — too short for a blog-post generation. Fallback only. |
+| Netlify | ❌ risky | Documented "not accessible from Iran" reports. Synchronous functions time out at ~10s — too short for a synchronous generation, but enough for background create/poll/cancel. Fallback only. |
 | Vercel | ❌ | OFAC-blocks Iranian signup. |
 
 **The single biggest reliability lever is a custom domain.** Front whichever host
@@ -137,19 +137,23 @@ it before the VPS depends on this**, then set `OPENAI_BASE_URL` to
 | Var | Required | Meaning |
 |---|---|---|
 | `PROXY_SECRET` | **yes — the guard fails closed** | Shared guard. Must match `OPENAI_PROXY_SECRET` on the backend. Sent as the `x-proxy-secret` header. If it is unset or blank the relay refuses every request with **503 `proxy_not_configured`**, logs `[bookora-openai-proxy] FATAL` once, and `/healthz` answers **503 `misconfigured`** — it never serves unauthenticated. Serving without it would be an open, anonymising relay to `api.openai.com` on our hostname, at a public URL. |
-| `ALLOWED_MODELS` | no | Comma-separated model allowlist, e.g. `gpt-4.1-mini,gpt-4.1`. When set, a JSON body whose `model` is not on the list gets 403. Leave unset to allow every model. |
+| `ALLOWED_MODELS` | no | Comma-separated model allowlist, e.g. `gpt-5*,gpt-4.1`. Each entry is an exact id, or a prefix ending in `*` (`gpt-5*` matches `gpt-5`, `gpt-5-mini`, `gpt-5-2025-08-07`, but never `gpt-4.1-mini`). When set, a JSON body whose `model` is not admitted gets 403 `model_not_allowed`; requests with no JSON body or no `model` (polls, cancels, `/v1/models`) pass. **List both the backend's `OPENAI_MODEL` and `OPENAI_FALLBACK_MODEL`**, or the fallback is refused. Leave unset to allow every model. |
 | `MAX_BODY_BYTES` | no | Request-body cap, default `2097152` (2 MiB). Over the cap → 413. |
-| `UPSTREAM_TIMEOUT_MS` | no | How long to wait for OpenAI's **response headers**, default `60000`. The timer is cleared the moment headers arrive, so a long streaming generation is never truncated. |
+| `UPSTREAM_TIMEOUT_MS` | no | How long to wait for OpenAI's **response headers**, default `120000` (Deno, Cloudflare) / `9000` (Netlify). The timer is cleared the moment headers arrive, so a long streaming generation is never truncated. Background create/poll/cancel answer in seconds; the 120s default only covers the backend's synchronous fallback. |
 
 Generate the secret with `openssl rand -hex 32`.
 
 Already set on the live app: `PROXY_SECRET` (stored as a secret, so its value is
 write-only — the API returns `null` for it) and `ALLOWED_MODELS=gpt-4.1,gpt-4.1-mini`,
-which matches the backend's `OPENAI_MODEL=gpt-4.1`. Widening `OPENAI_MODEL` means
-widening `ALLOWED_MODELS` too, or the proxy returns 403 for the new model.
+which matches the backend's old `OPENAI_MODEL=gpt-4.1`. The backend now defaults to
+`OPENAI_MODEL=gpt-5` with `OPENAI_FALLBACK_MODEL=gpt-4.1`, so the live value must
+become `gpt-5*,gpt-4.1` **before** the VPS switches models — see the owner checklist
+under *Responses API + background polling*.
 
 ```bash
 deno deploy env add --secret PROXY_SECRET "$(openssl rand -hex 32)" \
+  --org raegartargarian --app bookora-op
+deno deploy env add ALLOWED_MODELS 'gpt-5*,gpt-4.1' \
   --org raegartargarian --app bookora-op
 deno deploy env list --org raegartargarian --app bookora-op
 ```
@@ -177,6 +181,19 @@ curl -N -sS https://ai.bookora.net/v1/chat/completions \
   -d '{"model":"gpt-4.1-mini","stream":true,"messages":[{"role":"user","content":"یک جمله بنویس"}]}'
 ```
 
+Background mode, the way the backend calls it (create, then poll by id):
+
+```bash
+ID=$(curl -sS https://ai.bookora.net/v1/responses \
+  -H "x-proxy-secret: $OPENAI_PROXY_SECRET" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5","input":"یک جمله بنویس","background":true,"store":true}' | jq -r .id)
+curl -sS "https://ai.bookora.net/v1/responses/$ID" \
+  -H "x-proxy-secret: $OPENAI_PROXY_SECRET" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq '{status, output_text}'
+```
+
 Liveness, no secret needed: `curl https://ai.bookora.net/healthz` → `{"status":"ok",…}`.
 It is also the misconfiguration alarm: with `PROXY_SECRET` unset it answers **503**
 `{"status":"misconfigured",…}`, so an uptime ping catches the open-relay case
@@ -202,9 +219,11 @@ Same curl test as above.
 
 ## Option C — Netlify (last resort)
 
-Reachability from Iran is unreliable **and** free synchronous functions are
-capped at ~10s, which is not enough for a full blog draft. Use it only to
-unblock development, and prefer Deno Deploy for production.
+Reachability from Iran is unreliable, and free synchronous functions are capped
+at ~10s. That is not enough for a synchronous blog draft, but the backend's
+background create, poll and cancel calls each answer in well under the
+function's 9s header timeout, so polling works here. Use it only to unblock
+development, and prefer Deno Deploy for production.
 
 1. `npx netlify-cli deploy --prod` from this folder, or connect the repo with
    base directory `openai-proxy`.
@@ -231,24 +250,74 @@ unblock development, and prefer Deno Deploy for production.
 OPENAI_BASE_URL=https://ai.bookora.net/v1     # this proxy, INCLUDING /v1
 OPENAI_API_KEY=sk-proj-...                   # the real OpenAI key — only the VPS holds it
 OPENAI_PROXY_SECRET=<same value as PROXY_SECRET on the proxy>
-OPENAI_MODEL=gpt-4.1-mini                    # default model for blog/SEO generation
+OPENAI_MODEL=gpt-5                           # primary model for blog/SEO generation
+OPENAI_FALLBACK_MODEL=gpt-4.1                # tried once on a model-level failure; empty disables
 ```
 
-The official `openai` SDK takes `baseURL` verbatim and appends `/chat/completions`,
-`/responses`, `/embeddings`, `/models` — which is why `OPENAI_BASE_URL` ends with
-`/v1`, matching the shape of the real `https://api.openai.com/v1`:
-
-```ts
-new OpenAI({
-  apiKey: config.openai.apiKey,
-  baseURL: config.openai.baseUrl,
-  defaultHeaders: { 'x-proxy-secret': config.openai.proxySecret },
-});
-```
+The backend's `HttpOpenAiClient` appends `/responses` (and `/responses/{id}`,
+`/responses/{id}/cancel`) to the base URL — which is why `OPENAI_BASE_URL` ends
+with `/v1`, matching the shape of the real `https://api.openai.com/v1`. Every call
+carries `Authorization: Bearer <key>` and `x-proxy-secret`.
 
 Set `OPENAI_BASE_URL=https://api.openai.com/v1` and drop the secret header to run
 against OpenAI directly from a machine that can reach it (e.g. a dev laptop) —
 nothing else changes.
+
+---
+
+## Responses API + background polling
+
+The backend calls OpenAI's Responses API in **background mode** and polls for
+the result, instead of holding one request open for the whole generation.
+
+**Why.** A gpt-5 article at `medium` reasoning effort can run for minutes, and a
+synchronous request that long crosses two limits in the path:
+
+- this relay's `UPSTREAM_TIMEOUT_MS`, which used to abort at 60s when OpenAI had
+  not yet sent response headers (a non-streaming call sends none until it is done);
+- Deno Deploy's own request cutoff — a sibling project measured a hard ~120s limit
+  (503 `DEPLOYMENT_TIMED_OUT`) and saw gpt-5 at `medium` reach 95s, which is why it
+  had to pin `low` effort.
+
+Streaming would avoid the header timeout but still keeps one connection open for
+minutes through a censored path. With polling, every exchange is a few seconds,
+and a poll dropped in transit is simply retried on the next tick.
+
+**Which paths.** All three go through the ordinary `/v1/*` forwarding:
+
+| Call | Body | Allowlist |
+|---|---|---|
+| `POST /v1/responses` | JSON with `model`, `instructions`, `input`, `text`, `reasoning`, `max_output_tokens`, `background: true`, `store: true` → `{id, status: "queued"}` | `model` is checked |
+| `GET /v1/responses/{id}` | none, every ~3s until `completed` / `failed` / `incomplete` / `cancelled` | no `model`, passes |
+| `POST /v1/responses/{id}/cancel` | empty, best-effort on the backend's deadline | no `model`, passes |
+
+The request body carries the alias (`gpt-5`, `gpt-4.1`); OpenAI may echo a dated
+snapshot name in the response, which the relay never inspects. Stored background
+responses hold platform marketing copy only, never patient data.
+
+**No proxy change is required on the live Deno app beyond widening
+`ALLOWED_MODELS`.** It already forwards any `/v1/*` path and method. The raised
+120s header-timeout default in this repo is belt-and-braces for the backend's one
+synchronous fallback (used if an account rejects `background`); the live app works
+without redeploying it.
+
+### Owner checklist
+
+1. On Deno Deploy, set `ALLOWED_MODELS=gpt-5*,gpt-4.1` **first**. If the VPS
+   switches to `gpt-5` while the relay still allows only `gpt-4.1,gpt-4.1-mini`,
+   every primary call gets 403 `model_not_allowed` and silently runs on the
+   fallback.
+   ```bash
+   deno deploy env add ALLOWED_MODELS 'gpt-5*,gpt-4.1' --org raegartargarian --app bookora-op
+   ```
+2. Confirm: a `POST /v1/responses` with `"model":"gpt-5","background":true` returns
+   an `id`, and `GET /v1/responses/<id>` returns its status.
+3. Then switch `OPENAI_MODEL` (and the new `OPENAI_*` settings) on the VPS and
+   redeploy the backend.
+4. Publish this folder to the deploy repo once the changes are committed:
+   ```bash
+   git subtree push --prefix=openai-proxy proxy main
+   ```
 
 ---
 
@@ -263,23 +332,25 @@ nothing else changes.
 | Request body | Raw bytes (`arrayBuffer`, never `.text()`), so multipart/binary uploads survive. Capped at `MAX_BODY_BYTES` → 413. |
 | Response | `ReadableStream` passed straight through — no buffering, no re-encoding. Upstream `content-type` is preserved (so `text/event-stream` stays SSE), plus `cache-control: no-cache, no-transform` and `x-accel-buffering: no` to stop any proxy in the path from buffering. Stale `content-encoding`/`content-length` are dropped, since the runtime already decoded the body. |
 | Status & errors | Upstream status and OpenAI's error JSON are relayed verbatim, so the backend's existing 401/429/400 handling still works. |
-| Timeouts | `UPSTREAM_TIMEOUT_MS` bounds the wait for response **headers** only; once they arrive the timer is cleared so long generations stream to completion. Timeout → 504 `upstream_timeout`; connection failure → 502 `upstream_unreachable`. |
+| Model allowlist | `ALLOWED_MODELS` entries are exact ids or `prefix*`. Only a JSON body's `model` is checked; body-less polls and cancels pass. Refusal → 403 `model_not_allowed`, which the backend treats as a model-level failure and answers with its fallback model. |
+| Timeouts | `UPSTREAM_TIMEOUT_MS` bounds the wait for response **headers** only (default 120s; 9s on Netlify); once they arrive the timer is cleared so long generations stream to completion. Timeout → 504 `upstream_timeout`; connection failure → 502 `upstream_unreachable`. |
 | Proxy's own errors | Always OpenAI-shaped: `{"error":{"message":"…","type":"proxy_error","param":null,"code":"…"}}`. Codes: `proxy_not_configured`, `invalid_proxy_secret`, `unknown_path`, `missing_authorization`, `payload_too_large`, `model_not_allowed`, `upstream_timeout`, `upstream_unreachable`. |
 
 ---
 
 ## Tests
 
-Path forwarding, the secret guard, key forwarding, the model allowlist, the body
+Path forwarding, the secret guard, key forwarding, the model allowlist (including
+`prefix*` entries), the Responses background create/poll/cancel paths, the body
 cap, SSE passthrough and the 502 path are all covered. No dependencies, no
 network — `globalThis.fetch` is stubbed.
 
 ```bash
 # Deno build
-cd deno && deno test --allow-env main_test.ts
+cd deno && deno test -A
 
 # Cloudflare + Netlify builds
-npm test          # node --test "test/**/*.test.mjs"
+npm test          # node --test test/*.test.mjs
 ```
 
 ---

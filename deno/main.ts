@@ -11,6 +11,13 @@
  * OpenAI's error JSON verbatim, and streams SSE responses back byte-for-byte
  * without buffering.
  *
+ * The backend drives the Responses API in background mode: `POST /v1/responses`
+ * with `background:true` returns an id within seconds, then `GET
+ * /v1/responses/{id}` is polled and `POST /v1/responses/{id}/cancel` is sent on
+ * its own deadline. Every exchange is short, so no single request comes near
+ * this relay's header timeout or the hosting platform's request cutoff. Those
+ * paths need no special handling: any `/v1/*` path and method is forwarded.
+ *
  * **No API key is stored here.** The key travels in the `Authorization` header
  * on every request, from the backend, and is forwarded untouched. A request
  * without that header is rejected with 401 — the proxy has nothing to fall back
@@ -27,11 +34,18 @@
  *                         `misconfigured`, because a relay that serves without a
  *                         secret is an open relay to api.openai.com on our
  *                         hostname.
- *   - ALLOWED_MODELS      optional comma-separated model allowlist (e.g. gpt-4.1-mini,gpt-4.1)
+ *   - ALLOWED_MODELS      optional comma-separated model allowlist. Entries are
+ *                         exact ids, or a prefix ending in `*` (`gpt-5*` matches
+ *                         `gpt-5`, `gpt-5-mini`, `gpt-5-2025-08-07`). It must list
+ *                         BOTH the backend's primary and fallback model, e.g.
+ *                         `gpt-5*,gpt-4.1`, or the fallback is refused with 403.
  *   - MAX_BODY_BYTES      optional request-body cap (default 2097152 = 2 MiB)
  *   - UPSTREAM_TIMEOUT_MS optional time to wait for upstream response HEADERS
- *                         (default 60000). Once headers arrive the timer is
+ *                         (default 120000). Once headers arrive the timer is
  *                         cleared so long streaming generations are never cut.
+ *                         Background create/poll/cancel answer in seconds; the
+ *                         generous default only covers the backend's synchronous
+ *                         fallback for an account that rejects `background`.
  *
  * Backend wiring:
  *   OPENAI_BASE_URL=https://ai.bookora.net/v1
@@ -42,7 +56,7 @@
 const UPSTREAM_ORIGIN = "https://api.openai.com";
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_TIMEOUT_MS = 120_000;
 
 /**
  * Request headers we relay upstream. An allowlist rather than a blocklist:
@@ -161,9 +175,30 @@ export function parseAllowedModels(raw: string | undefined): Set<string> {
 }
 
 /**
+ * Whether `model` passes the allowlist. An empty allowlist allows everything.
+ * Entries match exactly, except an entry ending in `*`, which matches any id
+ * starting with the text before it — so `gpt-5*` admits dated snapshots and the
+ * `-mini` variant without also admitting `gpt-4.1-mini`. The prefix is literal
+ * text, not a family boundary (`gpt-5*` would also admit a future `gpt-50`), so
+ * keep prefixes specific.
+ */
+export function isModelAllowed(model: string, allowed: Set<string>): boolean {
+  if (allowed.size === 0) return true;
+  for (const entry of allowed) {
+    if (entry.endsWith("*")) {
+      if (model.startsWith(entry.slice(0, -1))) return true;
+    } else if (entry === model) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * When an allowlist is configured, read the `model` field out of a JSON body.
  * Returns the model name, or `null` when the body carries none (embeddings via
- * form data, `/v1/models`, …) — those are let through untouched.
+ * form data, `/v1/models`, a background poll `GET /v1/responses/{id}`, its
+ * body-less `POST …/cancel`) — those are let through untouched.
  */
 export function extractModel(
   bodyBytes: BufferSource | null,
@@ -258,7 +293,7 @@ export async function handleRequest(request: Request, env: EnvSource): Promise<R
   const allowedModels = parseAllowedModels(env.get("ALLOWED_MODELS"));
   if (allowedModels.size > 0) {
     const model = extractModel(bodyBytes, request.headers.get("content-type"));
-    if (model && !allowedModels.has(model)) {
+    if (model && !isModelAllowed(model, allowedModels)) {
       return apiError(
         403,
         `Model '${model}' is not allowed by this proxy.`,
