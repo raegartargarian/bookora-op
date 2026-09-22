@@ -12,8 +12,10 @@ import {
   DEFAULT_TIMEOUT_MS,
   extractModel,
   handleRequest,
+  isFetchTargetAllowed,
   isModelAllowed,
   parseAllowedModels,
+  resolveTelegramPath,
   resolveUpstreamPath,
   safeEqual,
 } from "./main.ts";
@@ -465,6 +467,136 @@ Deno.test("gpt-4.1-mini is refused by a gpt-5*,gpt-4.1 allowlist", async () => {
     assertEquals(res.status, 403);
     assertEquals((await res.json()).error.code, "model_not_allowed");
     assertEquals(stub.captured.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+// --- telegram --------------------------------------------------------------
+
+Deno.test("resolveTelegramPath only admits the allowlisted Bot API methods", () => {
+  assertEquals(
+    resolveTelegramPath("/telegram/bot123:AbC-_9/sendPhoto"),
+    "/bot123:AbC-_9/sendPhoto",
+  );
+  assertEquals(resolveTelegramPath("/telegram/bot123:AbC/sendMessage"), "/bot123:AbC/sendMessage");
+  assertEquals(resolveTelegramPath("/telegram/bot123:AbC/deleteMessage"), null);
+  assertEquals(resolveTelegramPath("/telegram/bot1:A/sendPoll"), "/bot1:A/sendPoll");
+  assertEquals(
+    resolveTelegramPath("/telegram/bot1:A/editMessageReplyMarkup"),
+    "/bot1:A/editMessageReplyMarkup",
+  );
+  assertEquals(resolveTelegramPath("/telegram/bot123:AbC/sendPhoto/extra"), null);
+  assertEquals(resolveTelegramPath("/telegram/../v1/responses"), null);
+  assertEquals(resolveTelegramPath("/telegram/notabot/sendMessage"), null);
+});
+
+Deno.test("telegram route needs the proxy secret and forwards to api.telegram.org", async () => {
+  const stub = stubFetch(okJson);
+  try {
+    const refused = await handleRequest(
+      post("/telegram/bot123:AbC/sendMessage", { chat_id: "@c", text: "hi" }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(refused.status, 403);
+    assertEquals(stub.captured.length, 0);
+
+    const blocked = await handleRequest(
+      post("/telegram/bot123:AbC/deleteMessage", {}, { "x-proxy-secret": SECRET }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(blocked.status, 404);
+    assertEquals(stub.captured.length, 0);
+
+    const ok = await handleRequest(
+      post("/telegram/bot123:AbC/sendMessage", { chat_id: "@c", text: "hi" }, {
+        "x-proxy-secret": SECRET,
+      }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(ok.status, 200);
+    assertEquals(stub.captured.length, 1);
+    assertEquals(stub.captured[0].url, "https://api.telegram.org/bot123:AbC/sendMessage");
+  } finally {
+    stub.restore();
+  }
+});
+
+Deno.test("telegram route does not apply the OpenAI model allowlist", async () => {
+  const stub = stubFetch(okJson);
+  try {
+    const res = await handleRequest(
+      post("/telegram/bot123:AbC/sendMessage", { chat_id: "@c", text: "hi", model: "x" }, {
+        "x-proxy-secret": SECRET,
+      }),
+      env({ PROXY_SECRET: SECRET, ALLOWED_MODELS: "gpt-5*" }),
+    );
+    assertEquals(res.status, 200);
+  } finally {
+    stub.restore();
+  }
+});
+
+// --- source fetch ----------------------------------------------------------
+
+Deno.test("isFetchTargetAllowed admits public https only", () => {
+  assert(isFetchTargetAllowed("https://www.allure.com/feed/rss", undefined));
+  assertEquals(isFetchTargetAllowed("http://www.allure.com/", undefined), null);
+  assertEquals(isFetchTargetAllowed("https://127.0.0.1/", undefined), null);
+  assertEquals(isFetchTargetAllowed("https://[::1]/", undefined), null);
+  assertEquals(isFetchTargetAllowed("https://localhost/x", undefined), null);
+  assertEquals(isFetchTargetAllowed("https://u:p@www.allure.com/", undefined), null);
+  assertEquals(isFetchTargetAllowed("not a url", undefined), null);
+  assertEquals(isFetchTargetAllowed(null, undefined), null);
+});
+
+Deno.test("isFetchTargetAllowed honours FETCH_ALLOWED_HOSTS with wildcards", () => {
+  const allow = "*.healthline.com, www.allure.com";
+  assert(isFetchTargetAllowed("https://www.healthline.com/rss", allow));
+  assert(isFetchTargetAllowed("https://healthline.com/rss", allow));
+  assert(isFetchTargetAllowed("https://www.allure.com/x", allow));
+  assertEquals(isFetchTargetAllowed("https://evil.com/", allow), null);
+  assertEquals(isFetchTargetAllowed("https://notallure.com/", allow), null);
+});
+
+Deno.test("/fetch needs the secret, refuses POST and bad URLs, and passes the body through", async () => {
+  const stub = stubFetch(() =>
+    new Response("<rss/>", { headers: { "content-type": "application/rss+xml" } })
+  );
+  try {
+    const q = "/fetch?url=" + encodeURIComponent("https://www.allure.com/feed/rss");
+    const noSecret = await handleRequest(
+      new Request("https://p.example" + q),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(noSecret.status, 403);
+
+    const post = await handleRequest(
+      new Request("https://p.example" + q, {
+        method: "POST",
+        headers: { "x-proxy-secret": SECRET },
+      }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(post.status, 405);
+
+    const bad = await handleRequest(
+      new Request("https://p.example/fetch?url=http%3A%2F%2Fx.com", {
+        headers: { "x-proxy-secret": SECRET },
+      }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(bad.status, 400);
+    assertEquals(stub.captured.length, 0);
+
+    const ok = await handleRequest(
+      new Request("https://p.example" + q, { headers: { "x-proxy-secret": SECRET } }),
+      env({ PROXY_SECRET: SECRET }),
+    );
+    assertEquals(ok.status, 200);
+    assertEquals(await ok.text(), "<rss/>");
+    assertEquals(ok.headers.get("content-type"), "application/rss+xml");
+    assertEquals(stub.captured[0].url, "https://www.allure.com/feed/rss");
   } finally {
     stub.restore();
   }

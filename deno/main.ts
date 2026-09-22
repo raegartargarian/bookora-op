@@ -40,6 +40,9 @@
  *                         BOTH the backend's primary and fallback model, e.g.
  *                         `gpt-5*,gpt-4.1`, or the fallback is refused with 403.
  *   - MAX_BODY_BYTES      optional request-body cap (default 2097152 = 2 MiB)
+ *   - FETCH_ALLOWED_HOSTS  optional host allowlist for `/fetch` (`*.example.com` ok)
+ *   - FETCH_MAX_BODY_BYTES optional cap for `/fetch` responses (default 15 MiB)
+ *   - TELEGRAM_MAX_BODY_BYTES optional cap for `/telegram/*` uploads (default 10 MiB)
  *   - UPSTREAM_TIMEOUT_MS optional time to wait for upstream response HEADERS
  *                         (default 120000). Once headers arrive the timer is
  *                         cleared so long streaming generations are never cut.
@@ -54,6 +57,191 @@
  */
 
 const UPSTREAM_ORIGIN = "https://api.openai.com";
+
+/**
+ * ── TELEGRAM ─────────────────────────────────────────────────────────────────
+ *
+ * `api.telegram.org` is filtered from the VPS too, so the blog autopost to the
+ * `@bookora_smart` channel rides this same relay:
+ *
+ *   POST /telegram/bot<token>/<method>  ──▶  https://api.telegram.org/bot<token>/<method>
+ *
+ * Behind the SAME `x-proxy-secret` guard as `/v1/*`, and narrower than it: only
+ * the Bot API methods the backend actually calls are forwarded, so a leaked
+ * secret cannot turn this into a general Telegram relay. The bot token travels
+ * in the path from the backend and is never stored here — the same stance as
+ * the OpenAI key. Photos are uploaded as multipart bytes (Telegram's servers
+ * cannot fetch an image from an Iranian host), so the body cap is its own:
+ * `TELEGRAM_MAX_BODY_BYTES`, default 10 MiB — Bot API `sendPhoto` allows 10 MB.
+ */
+const TELEGRAM_ORIGIN = "https://api.telegram.org";
+const TELEGRAM_PATH = /^\/telegram\/(bot\d+:[A-Za-z0-9_-]+)\/([A-Za-z]+)$/;
+export const TELEGRAM_METHODS = new Set([
+  "getMe",
+  "getChat",
+  "sendMessage",
+  "sendPhoto",
+  // The daily quiz (a native quiz poll) and the share button retarget.
+  "sendPoll",
+  "editMessageReplyMarkup",
+]);
+const DEFAULT_TELEGRAM_MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+/** `/telegram/bot<token>/<method>` → the upstream path, or null when not allowed. */
+export function resolveTelegramPath(pathname: string): string | null {
+  const match = TELEGRAM_PATH.exec(pathname);
+  if (!match) return null;
+  const [, bot, method] = match;
+  if (!TELEGRAM_METHODS.has(method)) return null;
+  return `/${bot}/${method}`;
+}
+
+/**
+ * ── SOURCE FETCH ─────────────────────────────────────────────────────────────
+ *
+ * The blog pipeline reads RSS feeds, articles and their hero images from
+ * international beauty sites, some of which are filtered from the VPS. The
+ * backend tries direct first and falls back here:
+ *
+ *   GET /fetch?url=<urlencoded https URL>   ──▶  that URL, body passed through
+ *
+ * Behind the same `x-proxy-secret`. GET only, https only, no IP literals or
+ * localhost, redirects followed but re-checked, body capped by
+ * `FETCH_MAX_BODY_BYTES` (default 15 MiB). `FETCH_ALLOWED_HOSTS` (optional,
+ * comma-separated, `*.example.com` allowed) narrows it further.
+ */
+const DEFAULT_FETCH_MAX_BODY_BYTES = 15 * 1024 * 1024;
+
+export function isFetchTargetAllowed(
+  raw: string | null,
+  allowedHosts: string | undefined,
+): URL | null {
+  if (!raw) return null;
+  let target: URL;
+  try {
+    target = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (target.protocol !== "https:" || target.username || target.password) return null;
+  const host = target.hostname.toLowerCase();
+  if (
+    host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal") ||
+    /^[\d.]+$/.test(host) || host.includes(":") || host.startsWith("[")
+  ) {
+    return null;
+  }
+  const allow = (allowedHosts ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (allow.length > 0) {
+    const ok = allow.some((entry) =>
+      entry.startsWith("*.")
+        ? host === entry.slice(2) || host.endsWith(entry.slice(1))
+        : host === entry
+    );
+    if (!ok) return null;
+  }
+  return target;
+}
+
+async function relayFetch(request: Request, url: URL, env: EnvSource): Promise<Response> {
+  if (request.method !== "GET") {
+    return apiError(405, "Method not allowed.", "method_not_allowed");
+  }
+  let target = isFetchTargetAllowed(url.searchParams.get("url"), env.get("FETCH_ALLOWED_HOSTS"));
+  if (!target) return apiError(400, "url must be an allowed https URL.", "invalid_url");
+
+  const maxBodyBytes = positiveInt(env.get("FETCH_MAX_BODY_BYTES"), DEFAULT_FETCH_MAX_BODY_BYTES);
+  const timeoutMs = positiveInt(env.get("UPSTREAM_TIMEOUT_MS"), DEFAULT_TIMEOUT_MS);
+  const signal = AbortSignal.timeout(timeoutMs);
+  const headers = {
+    "user-agent": "Mozilla/5.0 (compatible; BookoraBot/1.0; +https://bookora.net)",
+    "accept": request.headers.get("accept") ?? "*/*",
+  };
+  try {
+    // Redirects by hand so every hop passes the same target check.
+    for (let hop = 0; hop < 5; hop++) {
+      const upstream = await fetch(target.href, { headers, redirect: "manual", signal });
+      const location = upstream.headers.get("location");
+      if (upstream.status >= 300 && upstream.status < 400 && location) {
+        const next = isFetchTargetAllowed(
+          new URL(location, target).href,
+          env.get("FETCH_ALLOWED_HOSTS"),
+        );
+        if (!next) return apiError(400, "Redirect to a disallowed URL.", "invalid_redirect");
+        target = next;
+        continue;
+      }
+      const declared = Number(upstream.headers.get("content-length") ?? "0");
+      if (Number.isFinite(declared) && declared > maxBodyBytes) {
+        return apiError(413, `Upstream body exceeds ${maxBodyBytes} bytes.`, "payload_too_large");
+      }
+      const body = await upstream.arrayBuffer();
+      if (body.byteLength > maxBodyBytes) {
+        return apiError(413, `Upstream body exceeds ${maxBodyBytes} bytes.`, "payload_too_large");
+      }
+      return new Response(body, {
+        status: upstream.status,
+        headers: {
+          "content-type": upstream.headers.get("content-type") ?? "application/octet-stream",
+          "x-final-url": target.href,
+          "cache-control": "no-store",
+        },
+      });
+    }
+    return apiError(508, "Too many redirects.", "too_many_redirects");
+  } catch (err) {
+    return apiError(502, `Fetch failed: ${(err as Error).message}`, "upstream_unreachable");
+  }
+}
+
+async function relayTelegram(request: Request, url: URL, env: EnvSource): Promise<Response> {
+  const upstreamPath = resolveTelegramPath(url.pathname);
+  if (!upstreamPath) {
+    return apiError(404, "Not an allowed Telegram Bot API call.", "unknown_path");
+  }
+  if (request.method !== "POST" && request.method !== "GET") {
+    return apiError(405, "Method not allowed.", "method_not_allowed");
+  }
+  const maxBodyBytes = positiveInt(
+    env.get("TELEGRAM_MAX_BODY_BYTES"),
+    DEFAULT_TELEGRAM_MAX_BODY_BYTES,
+  );
+  let body: ArrayBuffer | null = null;
+  if (request.method === "POST") {
+    body = await request.arrayBuffer();
+    if (body.byteLength > maxBodyBytes) {
+      return apiError(413, `Request body exceeds ${maxBodyBytes} bytes.`, "payload_too_large");
+    }
+  }
+  const headers = new Headers();
+  const contentType = request.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
+
+  const timeoutMs = positiveInt(env.get("UPSTREAM_TIMEOUT_MS"), DEFAULT_TIMEOUT_MS);
+  try {
+    const upstream = await fetch(`${TELEGRAM_ORIGIN}${upstreamPath}${url.search}`, {
+      method: request.method,
+      headers,
+      body: body && body.byteLength > 0 ? body : undefined,
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    // Telegram answers small JSON; buffer it and pass the status through.
+    return new Response(await upstream.arrayBuffer(), {
+      status: upstream.status,
+      headers: {
+        "content-type": upstream.headers.get("content-type") ?? "application/json",
+        "cache-control": "no-store",
+      },
+    });
+  } catch (err) {
+    return apiError(
+      502,
+      `Telegram upstream failed: ${(err as Error).message}`,
+      "upstream_unreachable",
+    );
+  }
+}
 
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -259,6 +447,13 @@ export async function handleRequest(request: Request, env: EnvSource): Promise<R
   }
   if (!safeEqual(request.headers.get("x-proxy-secret"), secret)) {
     return apiError(403, "Forbidden: missing or invalid x-proxy-secret.", "invalid_proxy_secret");
+  }
+
+  if (url.pathname.startsWith("/telegram/")) {
+    return relayTelegram(request, url, env);
+  }
+  if (url.pathname === "/fetch") {
+    return relayFetch(request, url, env);
   }
 
   const upstreamPath = resolveUpstreamPath(url.pathname);

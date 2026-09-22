@@ -367,3 +367,11 @@ netlify.toml                  publish dir + /ai/* routing
 public/index.html             noindex placeholder page
 test/worker.test.mjs          node:test suite for the Worker + Netlify builds
 ```
+
+## Telegram route
+
+`POST /telegram/bot<token>/<method>` forwards to `https://api.telegram.org/bot<token>/<method>`,
+behind the same `x-proxy-secret` guard. Only `getMe`, `getChat`, `sendMessage`, `sendPhoto`,
+`sendPoll` and `editMessageReplyMarkup` are forwarded; anything else is a 404. Uploads are capped by `TELEGRAM_MAX_BODY_BYTES`
+(default 10 MiB). The bot token is sent by the backend and never stored here. Only
+`deno/main.ts` implements this route — the Netlify and Worker variants do not.
